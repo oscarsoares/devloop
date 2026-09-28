@@ -1,0 +1,39 @@
+[project]
+name = "devloop"
+version = "0.1.0"
+description = "An always-on executor that reviews open PRs and develops ready issues, one repository at a time."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pyright>=1.1.390", "ruff>=0.8"]
+
+[project.scripts]
+devloop = "devloop.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Strict from the first commit, not "later". The orchestrator this replaces was written in
+# PowerShell, and three of its bugs were a property that did not exist, a value that
+# survived a loop iteration, and a shape that differed between two API payloads. All three
+# are what a strict type checker exists to catch.
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RET", "PTH", "TRY"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
