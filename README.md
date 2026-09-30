@@ -72,9 +72,9 @@ devloop run "summarise the open PRs"     # one prompt, streaming events and cost
 `status` is read-only by construction, which is what makes the rest inspectable: you can see
 the decision before anything acts on it.
 
-Not yet built: durable state (SQLite), the tick loop and its budgets, label writes,
-per-repository configuration, and the scheduler.
+State is durable, in SQLite beside the user's other tool state (`~/.devloop/state.db`). It
+holds the three things that must survive a tick ending and do not exist on GitHub: review
+rounds per PR, open escalations, and cycle history with spend.
 
-One consequence of the missing state: `rounds` is always zero, because iterations spent are
-local knowledge and GitHub has no such field. Until SQLite lands, the 3-iteration budget
-cannot be enforced across ticks.
+Not yet built: the tick loop and its budgets, label writes, per-repository configuration, and
+the scheduler.

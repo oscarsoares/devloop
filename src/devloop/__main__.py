@@ -20,6 +20,7 @@ from devloop.drivers.cli import CliDriver, DriverError
 from devloop.events import Event, Result, SessionStarted, Text, ToolCall, Unknown
 from devloop.github import GhRepository, GitHubError, Repository
 from devloop.models import Budget
+from devloop.store import Store, default_path, open_store
 
 
 def _use_utf8_stdout() -> None:
@@ -81,19 +82,23 @@ def _parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="report what the loop would do, changing nothing")
     status.add_argument("repo", help="owner/name, e.g. oscarsoares/altrus")
+    status.add_argument("--state", type=Path, default=None, help="state database to read")
     return parser
 
 
-def _status(repo: Repository, budget: Budget) -> int:
+def _status(repo: Repository, budget: Budget, store: Store) -> int:
     """What the loop sees and what it would pick. Read-only by construction.
 
     This is deliberately the first command after `run`: a decision you can inspect without it
     acting is what makes the rest trustworthy.
     """
-    prs = repo.open_pull_requests()
+    fetched = repo.open_pull_requests()
     issues = (
-        repo.open_issues_given(prs) if isinstance(repo, GhRepository) else repo.open_issues()
+        repo.open_issues_given(fetched) if isinstance(repo, GhRepository) else repo.open_issues()
     )
+    # Rounds live only here. Without this the budget reads as zero for every PR, and a PR
+    # holding its merge gate would be reviewed on every tick forever.
+    prs = store.hydrate_rounds(repo.slug, fetched)
 
     print(f"{repo.slug}: {len(prs)} open PR(s), {len(issues)} open issue(s)")
 
@@ -105,11 +110,33 @@ def _status(repo: Repository, budget: Budget) -> int:
             else:
                 state = f"waiting - {verdict.waiting.value if verdict.waiting else '?'}"
             mark = "*" if verdict.actionable else " "
-            print(f" {mark} #{verdict.pr.number:<5} {state:<38} {verdict.pr.title[:60]}")
+            spent = f"{verdict.pr.rounds}/{budget.max_review_rounds}"
+            print(
+                f" {mark} #{verdict.pr.number:<5} {spent:<5} {state:<32} "
+                f"{verdict.pr.title[:52]}"
+            )
 
     actionable = actionable_prs(prs, budget)
     ready = [i for i in issues if "ready-to-dev" in i.labels]
     candidate, from_triage = next_issue(ready, issues, budget)
+
+    escalations = store.open_escalations(repo.slug)
+    if escalations:
+        # Printed before the next move on purpose: a blocked issue nobody notices is work
+        # that disappeared, and it should not sit below the thing the loop is about to do.
+        print("\nWaiting on you")
+        for item in escalations:
+            print(f"   {item.subject} #{item.number:<5} {item.reason[:70]}")
+
+    spend = store.spend(repo.slug)
+    if spend.cycles:
+        per = spend.per_cycle()
+        floor = " at least," if spend.partial else ""
+        average = f", ${per:.4f}/cycle" if per is not None else ""
+        print(
+            f"\nSpend over {spend.cycles} recorded cycle(s):{floor} "
+            f"${spend.cost_usd:.4f}{average}"
+        )
 
     print("\nNext move")
     if actionable:
@@ -168,7 +195,8 @@ def main(
             return _run(args.prompt, args.cwd, chosen)
         case "status":
             try:
-                return _status(repo or GhRepository(slug=args.repo), Budget())
+                with open_store(args.state or default_path()) as store:
+                    return _status(repo or GhRepository(slug=args.repo), Budget(), store)
             except GitHubError as exc:
                 print(f"devloop: {exc}", file=sys.stderr)
                 return 1
