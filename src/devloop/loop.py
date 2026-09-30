@@ -26,7 +26,8 @@ from devloop.decide import actionable_prs, next_issue, rank_issues
 from devloop.drivers import ClaudeDriver
 from devloop.events import Result
 from devloop.github import Repository, Writes
-from devloop.models import Budget, Issue, Spend
+from devloop.models import Budget, Issue, PullRequest, Spend
+from devloop.prompts import issue_development_prompt, parse_decision, pr_review_prompt
 from devloop.store import CycleRecord, Store
 
 
@@ -34,26 +35,9 @@ class StopReason(StrEnum):
     IDLE = "no actionable PR and no selectable issue"
     CYCLE_BUDGET = "cycle budget spent; the rest carries to the next tick"
     TIME_BUDGET = "time budget spent; the rest carries to the next tick"
+    COST_BUDGET = "cost budget spent; the rest carries to the next tick"
     CYCLE_FAILED = "a cycle failed"
     DRY_RUN = "dry run: stopped after one decision"
-
-
-@dataclass(frozen=True, slots=True)
-class Prompts:
-    """How this repository's procedures are invoked.
-
-    Templates rather than hardcoded strings because the commands are the repository's, not
-    this tool's: another project may name them differently, and the loop should not care.
-    """
-
-    review: str = "/mvp-review {number}"
-    develop: str = "/mvp-next {number}"
-
-    def for_review(self, number: int) -> str:
-        return self.review.format(number=number)
-
-    def for_develop(self, number: int) -> str:
-        return self.develop.format(number=number)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +81,6 @@ class Tick:
     store: Store
     cwd: Path
     budget: Budget = field(default_factory=Budget)
-    prompts: Prompts = field(default_factory=Prompts)
     dry_run: bool = False
     clock: Callable[[], datetime] = _utcnow
     on_event: Callable[[str], None] = print
@@ -111,9 +94,20 @@ class Tick:
                 result = event
         return result
 
-    def _record(self, kind: str, target: int, started: datetime, result: Result | None) -> Cycle:
+    def _record(
+        self,
+        kind: str,
+        target: int,
+        started: datetime,
+        result: Result | None,
+        *,
+        usable: bool = True,
+    ) -> Cycle:
         # No Result means the run did not finish, whatever the process said on the way out.
-        ok = result is not None and result.ok
+        # `usable` is for a run that finished but produced nothing the loop can act on, such
+        # as a review with no readable DECISION: it cost money, so it is recorded, but it is
+        # not a completed round.
+        ok = result is not None and result.ok and usable
         cost = result.cost_usd if result else None
         if not self.dry_run:
             usage = result.usage if result else None
@@ -155,9 +149,34 @@ class Tick:
             if candidate.has_open_pr
         )
         if owned:
-            self.writes.relabel(
-                "issue", issue.number, add=["needs-review"], remove=["in-progress"]
+            self.writes.relabel("issue", issue.number, add=["needs-review"], remove=["in-progress"])
+
+    def _review(self, pr: PullRequest, started: datetime) -> Cycle:
+        """Review one PR: prompt, run, read the verdict, then say it on GitHub and in the store.
+
+        The store is written before GitHub is: a comment that fails to post loses text, while
+        a round that was not counted lets the same PR be reviewed past its budget.
+        """
+        detailed = self.repo.with_review_context(pr)
+        result = self._drive(pr_review_prompt(detailed))
+        reply = result.text if result and result.ok else ""
+        decision = parse_decision(reply)
+        cycle = self._record("review", pr.number, started, result, usable=decision is not None)
+        if decision is None:
+            self.on_event(f"review of PR #{pr.number} ended without a readable DECISION")
+            return cycle
+
+        self.store.record_review(self.repo.slug, pr.number, cycle.cost_usd or 0.0, decision)
+        self.writes.comment("pr", pr.number, reply)
+        if decision == "approve":
+            self.writes.relabel("pr", pr.number, add=["needs-review"], remove=["review-blocking"])
+        else:
+            self.writes.relabel("pr", pr.number, add=["review-blocking"], remove=["needs-review"])
+        if decision == "block":
+            self.store.raise_escalation(
+                self.repo.slug, "pr", pr.number, "The review blocked this PR; a human must decide."
             )
+        return cycle
 
     def _escalate(self, issue: Issue, reason: str) -> None:
         self.writes.relabel("issue", issue.number, add=["blocked"], remove=["in-progress"])
@@ -178,6 +197,12 @@ class Tick:
             if self.clock() >= deadline:
                 outcome.stop_reason = StopReason.TIME_BUDGET
                 break
+            # A cycle that reported no cost counts as zero here, so this is a floor: it can
+            # stop a tick late, never early.
+            cap = self.budget.max_cost_usd
+            if cap is not None and sum(c.cost_usd or 0.0 for c in outcome.cycles) >= cap:
+                outcome.stop_reason = StopReason.COST_BUDGET
+                break
 
             fetched = self.repo.open_pull_requests()
             prs = self.store.hydrate_rounds(self.repo.slug, fetched)
@@ -190,21 +215,17 @@ class Tick:
                     f"review PR #{target.pr.number} - {target.reason.value} "
                     f"(iteration {target.pr.rounds + 1} of {self.budget.max_review_rounds})"
                 )
-                prompt = self.prompts.for_review(target.pr.number)
-                result = None if self.dry_run else self._drive(prompt)
-                cycle = self._record("review", target.pr.number, started, result)
-                outcome.cycles.append(cycle)
-
-                if not self.dry_run:
-                    # Counted only now: a round that died halfway corrected nothing, and
-                    # charging it would retire a PR the loop never actually reviewed.
-                    if cycle.ok:
-                        self.store.record_review_round(self.repo.slug, target.pr.number)
-                    else:
-                        outcome.stop_reason = StopReason.CYCLE_FAILED
-                        break
                 if self.dry_run:
+                    outcome.cycles.append(self._record("review", target.pr.number, started, None))
                     outcome.stop_reason = StopReason.DRY_RUN
+                    break
+
+                # A round is counted only once it produced a verdict: a run that died halfway
+                # corrected nothing, and charging it would retire a PR never actually reviewed.
+                cycle = self._review(target.pr, started)
+                outcome.cycles.append(cycle)
+                if not cycle.ok:
+                    outcome.stop_reason = StopReason.CYCLE_FAILED
                     break
                 continue
 
@@ -224,7 +245,7 @@ class Tick:
 
             self.writes.relabel("issue", issue.number, add=["in-progress"], remove=["ready-to-dev"])
             started = self.clock()
-            result = None if self.dry_run else self._drive(self.prompts.for_develop(issue.number))
+            result = None if self.dry_run else self._drive(issue_development_prompt(issue))
             cycle = self._record("develop", issue.number, started, result)
             outcome.cycles.append(cycle)
 
@@ -232,6 +253,12 @@ class Tick:
                 outcome.stop_reason = StopReason.DRY_RUN
                 break
 
+            self.store.record_development(
+                self.repo.slug,
+                issue.number,
+                cycle.cost_usd or 0.0,
+                "done" if cycle.ok else "abandoned",
+            )
             if cycle.ok:
                 self._finish_development(issue)
             else:

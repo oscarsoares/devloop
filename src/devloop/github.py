@@ -42,6 +42,8 @@ class Repository(Protocol):
 
     def open_issues(self) -> list[Issue]: ...
 
+    def with_review_context(self, pr: PullRequest) -> PullRequest: ...
+
 
 class Writes(Protocol):
     """The only way the loop changes anything outside itself.

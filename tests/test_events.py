@@ -104,6 +104,18 @@ class TestResult:
         assert event.cost_usd == 0.8421
         assert event.usage.cache_read_tokens == 410_000
 
+    def test_the_final_reply_is_kept_whole(self) -> None:
+        reply = "a\nb\nDECISION: block"
+        line = json.dumps({"type": "result", "subtype": "success", "result": reply})
+        event = one(line)
+        assert isinstance(event, Result)
+        assert event.text == reply
+
+    def test_a_missing_reply_is_empty(self) -> None:
+        event = one('{"type":"result","subtype":"success"}')
+        assert isinstance(event, Result)
+        assert event.text == ""
+
     def test_a_missing_cost_is_none_not_zero(self) -> None:
         """The distinction the billing decision rests on: absent must not read as free."""
         event = one('{"type":"result","subtype":"success","usage":{"output_tokens":120}}')

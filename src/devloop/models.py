@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Literal
+
+Decision = Literal["approve", "request_changes", "block"]
+"""A review's verdict. The contract between the review prompt and whatever reads the reply."""
 
 
 class Priority(IntEnum):
@@ -117,6 +121,8 @@ class Budget:
     max_minutes: int = 150
     max_review_rounds: int = 3
     """Iterations one PR may receive before it escalates to a human."""
+    max_cost_usd: float | None = None
+    """Spend that ends a tick. Off by default: a cap is a policy, and none is assumed."""
     labels_excluding_selection: frozenset[str] = field(
         default_factory=lambda: frozenset({"in-progress", "blocked"})
     )

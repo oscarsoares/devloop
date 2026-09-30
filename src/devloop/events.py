@@ -63,6 +63,8 @@ class Result:
     cost_usd: float | None = None
     usage: Usage = field(default_factory=Usage)
     is_error: bool = False
+    text: str = ""
+    """The final reply, whole. `Text` keeps only a first line for progress; this is the answer."""
 
     @property
     def ok(self) -> bool:
@@ -180,6 +182,7 @@ def parse_line(line: str) -> list[Event]:
                     cost_usd=as_float(event.get("total_cost_usd")),
                     usage=_parse_usage(event.get("usage")),
                     is_error=event.get("is_error") is True,
+                    text=as_str(event.get("result")) or "",
                 )
             ]
         case _:

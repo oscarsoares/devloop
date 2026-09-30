@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from devloop.models import Issue, PullRequest
-from devloop.prompts import issue_development_prompt, pr_review_prompt
+from devloop.prompts import issue_development_prompt, parse_decision, pr_review_prompt
 
 
 class TestPrReview:
@@ -39,6 +41,28 @@ class TestPrReview:
         assert "(no comments yet)" in prompt
 
 
+class TestParseDecision:
+    @pytest.mark.parametrize("decision", ["approve", "request_changes", "block"])
+    def test_reads_each_decision(self, decision: str) -> None:
+        assert parse_decision(f"Some review.\n\nDECISION: {decision}\n") == decision
+
+    def test_is_case_insensitive_and_tolerates_markdown(self) -> None:
+        assert parse_decision("**Decision: Approve**") == "approve"
+
+    def test_the_last_line_wins(self) -> None:
+        assert parse_decision("DECISION: block\nOn reflection:\nDECISION: approve") == "approve"
+
+    def test_the_format_template_is_not_a_decision(self) -> None:
+        assert parse_decision("DECISION: approve | request_changes | block") is None
+
+    @pytest.mark.parametrize("reply", ["", "Looks fine.", "DECISION: maybe", "decision approve"])
+    def test_anything_else_is_none(self, reply: str) -> None:
+        assert parse_decision(reply) is None
+
+    def test_a_decision_mid_sentence_does_not_count(self) -> None:
+        assert parse_decision("I would DECISION: approve this") is None
+
+
 class TestIssueDevelopment:
     def test_includes_title_body_and_labels(self) -> None:
         prompt = issue_development_prompt(
@@ -60,6 +84,12 @@ class TestIssueDevelopment:
         assert "create" in prompt
         assert "tests" in prompt
         assert "commit" in prompt
+
+    def test_asks_for_a_branch_and_pr_the_loop_can_recognise(self) -> None:
+        """`issues_owned_by` reads the branch name and the `Closes #N`; the prompt must ask."""
+        prompt = issue_development_prompt(Issue(number=68))
+        assert "agent/issue-68-" in prompt
+        assert "Closes #68" in prompt
 
     def test_missing_body_and_labels_get_placeholders(self) -> None:
         prompt = issue_development_prompt(Issue(number=1))

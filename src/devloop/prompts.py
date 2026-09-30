@@ -6,9 +6,28 @@ subprocess. The `DECISION:` line is the contract the parser of the reply relies 
 
 from __future__ import annotations
 
-from devloop.models import Issue, PullRequest
+import re
+from typing import get_args
 
-DECISIONS = ("approve", "request_changes", "block")
+from devloop.models import Decision, Issue, PullRequest
+
+DECISIONS: tuple[Decision, ...] = get_args(Decision)
+
+_DECISION_LINE = re.compile(r"^\W*DECISION:\s*(\w+)\W*$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_decision(reply: str) -> Decision | None:
+    """The verdict on the last `DECISION:` line of a reply, or None if there is none.
+
+    The last one wins because the format is asked for at the end, and a review may quote the
+    instruction earlier. Anything outside the three values is None rather than a guess: a
+    reply the loop cannot read is a failed round, not an approval.
+    """
+    found = _DECISION_LINE.findall(reply)
+    if not found:
+        return None
+    value = found[-1].lower()
+    return next((d for d in DECISIONS if d == value), None)
 
 
 def _section(heading: str, content: str) -> str:
@@ -56,10 +75,13 @@ def issue_development_prompt(issue: Issue) -> str:
         _section(
             "Task",
             "Implement what the issue asks for:\n\n"
-            "1. Create or change the files needed.\n"
-            "2. Write tests that cover the new behaviour.\n"
-            "3. Run the tests and linters, and fix what they report.\n"
-            "4. Commit the work when it is finished, with a conventional commit message.",
+            f"1. Work on a new branch named `agent/issue-{issue.number}-<short-slug>`.\n"
+            "2. Create or change the files needed.\n"
+            "3. Write tests that cover the new behaviour.\n"
+            "4. Run the tests and linters, and fix what they report.\n"
+            "5. Commit the work when it is finished, with a conventional commit message.\n"
+            "6. Push the branch and open a pull request whose description says "
+            f"`Closes #{issue.number}`.",
         ),
     ]
     return "\n\n".join(sections) + "\n"

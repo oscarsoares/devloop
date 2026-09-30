@@ -27,12 +27,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast, get_args
 
-from devloop.models import PullRequest, Spend
+from devloop.models import Decision, PullRequest, Spend
 
 SCHEMA_VERSION = 2
 
 CycleKind = Literal["review", "develop"]
-Decision = Literal["approve", "request_changes", "block"]
 DevelopmentStatus = Literal["in_progress", "done", "abandoned"]
 
 _SCHEMA = """
