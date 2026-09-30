@@ -62,7 +62,12 @@ All three are expected to pass with zero findings before a commit.
 ## Status
 
 Ported and tested: stream parsing, the PR classifier, backlog triage, the driver seam, the
-CLI driver.
+CLI driver, and a `devloop` entry point whose `run` command drives one prompt and prints the
+events and cost as they arrive:
+
+```bash
+devloop run "summarise the open PRs" --cwd ../some-repo
+```
 
 Not yet built: durable state (SQLite), GitHub access behind its own interface, the tick loop
 and its budgets, per-repository configuration, and the scheduler.
