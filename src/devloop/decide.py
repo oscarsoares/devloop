@@ -39,6 +39,18 @@ class PrVerdict:
         return self.reason is not None
 
 
+@dataclass(frozen=True, slots=True)
+class Actionable:
+    """A PR the loop can move forward now, with the reason it can.
+
+    A separate type rather than a filtered `PrVerdict`, so `reason` is non-optional by
+    construction: callers cannot forget that the filtered list always has one.
+    """
+
+    pr: PullRequest
+    reason: Reason
+
+
 def classify_pr(pr: PullRequest, budget: Budget) -> PrVerdict:
     """Decide whether the loop can move this PR forward now.
 
@@ -75,10 +87,14 @@ def classify_pr(pr: PullRequest, budget: Budget) -> PrVerdict:
     return PrVerdict(pr, None, Waiting.HUMAN)
 
 
-def actionable_prs(prs: list[PullRequest], budget: Budget) -> list[PrVerdict]:
+def actionable_prs(prs: list[PullRequest], budget: Budget) -> list[Actionable]:
     """Actionable PRs, oldest first: the one closest to landing unblocks the most."""
-    verdicts = [classify_pr(pr, budget) for pr in prs]
-    return sorted((v for v in verdicts if v.actionable), key=lambda v: v.pr.number)
+    found = [
+        Actionable(pr=verdict.pr, reason=verdict.reason)
+        for verdict in (classify_pr(pr, budget) for pr in prs)
+        if verdict.reason is not None
+    ]
+    return sorted(found, key=lambda a: a.pr.number)
 
 
 _MONTH = re.compile(r"month\s*(\d+)", re.IGNORECASE)

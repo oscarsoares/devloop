@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import cast
+
+from devloop._json import as_dict, as_float, as_int, as_list, as_str
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,54 +84,24 @@ _TOOL_DETAIL_FIELDS = ("command", "file_path", "pattern", "path", "prompt")
 _MAX_DETAIL = 120
 
 
-def _as_int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-
-def _as_str(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
-def _as_dict(value: object) -> dict[str, object] | None:
-    """Narrow a decoded JSON value to an object.
-
-    The cast is sound and not a suppression: `json.loads` only ever produces `str` keys.
-    Without it, `isinstance(value, dict)` narrows to `dict[Unknown, Unknown]`, which strict
-    mode rejects — correctly, since every field read after that would be untyped.
-    """
-    return cast("dict[str, object]", value) if isinstance(value, dict) else None
-
-
-def _as_list(value: object) -> list[object] | None:
-    return cast("list[object]", value) if isinstance(value, list) else None
-
-
 def _parse_usage(raw: object) -> Usage:
-    usage = _as_dict(raw)
+    usage = as_dict(raw)
     if usage is None:
         return Usage()
     return Usage(
-        input_tokens=_as_int(usage.get("input_tokens")),
-        output_tokens=_as_int(usage.get("output_tokens")),
-        cache_read_tokens=_as_int(usage.get("cache_read_input_tokens")),
-        cache_write_tokens=_as_int(usage.get("cache_creation_input_tokens")),
+        input_tokens=as_int(usage.get("input_tokens")),
+        output_tokens=as_int(usage.get("output_tokens")),
+        cache_read_tokens=as_int(usage.get("cache_read_input_tokens")),
+        cache_write_tokens=as_int(usage.get("cache_creation_input_tokens")),
     )
 
 
-def _parse_cost(raw: object) -> float | None:
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    return None
-
-
 def _tool_detail(raw_input: object) -> str:
-    tool_input = _as_dict(raw_input)
+    tool_input = as_dict(raw_input)
     if tool_input is None:
         return ""
     for name in _TOOL_DETAIL_FIELDS:
-        value = _as_str(tool_input.get(name))
+        value = as_str(tool_input.get(name))
         if value:
             detail = " ".join(value.split())
             if len(detail) > _MAX_DETAIL:
@@ -140,28 +111,28 @@ def _tool_detail(raw_input: object) -> str:
 
 
 def _parse_assistant(message: object) -> list[Event]:
-    envelope = _as_dict(message)
+    envelope = as_dict(message)
     if envelope is None:
         return []
-    content = _as_list(envelope.get("content"))
+    content = as_list(envelope.get("content"))
     if content is None:
         return []
 
     events: list[Event] = []
     for raw_block in content:
-        block = _as_dict(raw_block)
+        block = as_dict(raw_block)
         if block is None:
             continue
-        match _as_str(block.get("type")):
+        match as_str(block.get("type")):
             case "tool_use":
                 events.append(
                     ToolCall(
-                        name=_as_str(block.get("name")) or "tool",
+                        name=as_str(block.get("name")) or "tool",
                         detail=_tool_detail(block.get("input")),
                     )
                 )
             case "text":
-                text = _as_str(block.get("text")) or ""
+                text = as_str(block.get("text")) or ""
                 first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
                 if first:
                     events.append(Text(text=first))
@@ -189,24 +160,24 @@ def parse_line(line: str) -> list[Event]:
     except json.JSONDecodeError:
         return [Unknown(raw=stripped)]
 
-    event = _as_dict(payload)
+    event = as_dict(payload)
     if event is None:
         return [Unknown(raw=stripped)]
 
-    match _as_str(event.get("type")):
+    match as_str(event.get("type")):
         case "system":
-            if _as_str(event.get("subtype")) == "init":
-                return [SessionStarted(session_id=_as_str(event.get("session_id")))]
+            if as_str(event.get("subtype")) == "init":
+                return [SessionStarted(session_id=as_str(event.get("session_id")))]
             return []
         case "assistant":
             return _parse_assistant(event.get("message"))
         case "result":
             return [
                 Result(
-                    subtype=_as_str(event.get("subtype")) or "unknown",
-                    turns=_as_int(event.get("num_turns")),
-                    duration_ms=_as_int(event.get("duration_ms")),
-                    cost_usd=_parse_cost(event.get("total_cost_usd")),
+                    subtype=as_str(event.get("subtype")) or "unknown",
+                    turns=as_int(event.get("num_turns")),
+                    duration_ms=as_int(event.get("duration_ms")),
+                    cost_usd=as_float(event.get("total_cost_usd")),
                     usage=_parse_usage(event.get("usage")),
                     is_error=event.get("is_error") is True,
                 )

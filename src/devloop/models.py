@@ -48,6 +48,9 @@ class PullRequest:
     checks: tuple[CheckState, ...] = ()
     rounds: int = 0
     """Review iterations already spent. The budget is per PR."""
+    head_ref: str = ""
+    body: str = ""
+    """Kept only to work out which issues this PR already owns; no decision reads them."""
 
     @property
     def has_pending_checks(self) -> bool:

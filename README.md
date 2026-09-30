@@ -62,12 +62,19 @@ All three are expected to pass with zero findings before a commit.
 ## Status
 
 Ported and tested: stream parsing, the PR classifier, backlog triage, the driver seam, the
-CLI driver, and a `devloop` entry point whose `run` command drives one prompt and prints the
-events and cost as they arrive:
+CLI driver, GitHub reads behind their own interface, and two commands.
 
 ```bash
-devloop run "summarise the open PRs" --cwd ../some-repo
+devloop status oscarsoares/altrus        # what the loop sees and would do; writes nothing
+devloop run "summarise the open PRs"     # one prompt, streaming events and cost
 ```
 
-Not yet built: durable state (SQLite), GitHub access behind its own interface, the tick loop
-and its budgets, per-repository configuration, and the scheduler.
+`status` is read-only by construction, which is what makes the rest inspectable: you can see
+the decision before anything acts on it.
+
+Not yet built: durable state (SQLite), the tick loop and its budgets, label writes,
+per-repository configuration, and the scheduler.
+
+One consequence of the missing state: `rounds` is always zero, because iterations spent are
+local knowledge and GitHub has no such field. Until SQLite lands, the 3-iteration budget
+cannot be enforced across ticks.

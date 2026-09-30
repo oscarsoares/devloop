@@ -8,14 +8,33 @@ to measure what a cycle costs, which is the number the driver choice is waiting 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from devloop.decide import actionable_prs, classify_pr, next_issue, rank_issues
 from devloop.drivers import ClaudeDriver
 from devloop.drivers.cli import CliDriver, DriverError
 from devloop.events import Event, Result, SessionStarted, Text, ToolCall, Unknown
+from devloop.github import GhRepository, GitHubError, Repository
+from devloop.models import Budget
+
+
+def _use_utf8_stdout() -> None:
+    """Print UTF-8 regardless of the console's code page.
+
+    A Windows console defaults to cp1252, which turns any non-ASCII character in a GitHub
+    title into a replacement glyph. `errors="replace"` keeps a stream that cannot be
+    reconfigured from taking the process down with it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            # A stream that refuses is not worth failing over.
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(encoding="utf-8", errors="replace")
 
 
 def _version() -> str:
@@ -59,7 +78,58 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("prompt")
     run.add_argument("--cwd", type=Path, default=Path.cwd(), help="repository to run in")
     run.add_argument("--permission-mode", default="acceptEdits")
+
+    status = commands.add_parser("status", help="report what the loop would do, changing nothing")
+    status.add_argument("repo", help="owner/name, e.g. oscarsoares/altrus")
     return parser
+
+
+def _status(repo: Repository, budget: Budget) -> int:
+    """What the loop sees and what it would pick. Read-only by construction.
+
+    This is deliberately the first command after `run`: a decision you can inspect without it
+    acting is what makes the rest trustworthy.
+    """
+    prs = repo.open_pull_requests()
+    issues = (
+        repo.open_issues_given(prs) if isinstance(repo, GhRepository) else repo.open_issues()
+    )
+
+    print(f"{repo.slug}: {len(prs)} open PR(s), {len(issues)} open issue(s)")
+
+    if prs:
+        print("\nPull requests")
+        for verdict in (classify_pr(pr, budget) for pr in prs):
+            if verdict.reason:
+                state = verdict.reason.value
+            else:
+                state = f"waiting - {verdict.waiting.value if verdict.waiting else '?'}"
+            mark = "*" if verdict.actionable else " "
+            print(f" {mark} #{verdict.pr.number:<5} {state:<38} {verdict.pr.title[:60]}")
+
+    actionable = actionable_prs(prs, budget)
+    ready = [i for i in issues if "ready-to-dev" in i.labels]
+    candidate, from_triage = next_issue(ready, issues, budget)
+
+    print("\nNext move")
+    if actionable:
+        first = actionable[0]
+        print(
+            f"  review PR #{first.pr.number} - {first.reason.value} "
+            f"(iteration {first.pr.rounds + 1} of {budget.max_review_rounds})"
+        )
+    elif candidate is not None:
+        source = "triage" if from_triage else "the ready-to-dev queue"
+        print(f"  develop issue #{candidate.issue.number} from {source} - {candidate.why}")
+        print(f"    {candidate.issue.title[:70]}")
+        runners_up = [c for c in rank_issues(issues, budget) if c is not candidate][:3]
+        if runners_up:
+            trailing = ", ".join(f"#{c.issue.number} ({c.why})" for c in runners_up)
+            print(f"    runners-up: {trailing}")
+    else:
+        print("  nothing — no actionable PR and no selectable issue")
+
+    return 0
 
 
 def _run(prompt: str, cwd: Path, driver: ClaudeDriver) -> int:
@@ -82,7 +152,13 @@ def _run(prompt: str, cwd: Path, driver: ClaudeDriver) -> int:
     return 0 if result is not None and result.ok else 1
 
 
-def main(argv: Sequence[str] | None = None, *, driver: ClaudeDriver | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    driver: ClaudeDriver | None = None,
+    repo: Repository | None = None,
+) -> int:
+    _use_utf8_stdout()
     parser = _parser()
     args = parser.parse_args(argv)
 
@@ -90,6 +166,12 @@ def main(argv: Sequence[str] | None = None, *, driver: ClaudeDriver | None = Non
         case "run":
             chosen = driver or CliDriver(permission_mode=args.permission_mode)
             return _run(args.prompt, args.cwd, chosen)
+        case "status":
+            try:
+                return _status(repo or GhRepository(slug=args.repo), Budget())
+            except GitHubError as exc:
+                print(f"devloop: {exc}", file=sys.stderr)
+                return 1
         case _:
             parser.print_help()
             return 0

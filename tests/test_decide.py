@@ -77,7 +77,7 @@ class TestPendingCiCutsBothWays:
 
 def test_actionable_prs_are_oldest_first() -> None:
     prs = [pr(number=94), pr(number=77), pr(number=89)]
-    assert [v.pr.number for v in actionable_prs(prs, BUDGET)] == [77, 89, 94]
+    assert [a.pr.number for a in actionable_prs(prs, BUDGET)] == [77, 89, 94]
 
 
 def issue(**kwargs: object) -> Issue:
