@@ -76,5 +76,7 @@ State is durable, in SQLite beside the user's other tool state (`~/.devloop/stat
 holds the three things that must survive a tick ending and do not exist on GitHub: review
 rounds per PR, open escalations, and cycle history with spend.
 
-Not yet built: the tick loop and its budgets, label writes, per-repository configuration, and
-the scheduler.
+`tick` runs one pass of the loop with its budgets and writes labels and comments through `gh`;
+it is a dry run unless `--execute` is given.
+
+Not yet built: per-repository configuration and the scheduler.

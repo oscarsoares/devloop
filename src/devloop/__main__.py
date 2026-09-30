@@ -70,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="devloop",
         description="Reviews open PRs and develops ready issues, one repository at a time.",
-        epilog="The tick loop is not built yet; `run` drives a single prompt.",
+        epilog="`tick` needs --execute to act; without it, it reports and changes nothing.",
     )
     parser.add_argument("--version", action="version", version=f"devloop {_version()}")
     commands = parser.add_subparsers(dest="command")
@@ -83,6 +83,21 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="report what the loop would do, changing nothing")
     status.add_argument("repo", help="owner/name, e.g. oscarsoares/altrus")
     status.add_argument("--state", type=Path, default=None, help="state database to read")
+
+    tick = commands.add_parser("tick", help="run one tick of the loop")
+    tick.add_argument("repo", help="owner/name, e.g. oscarsoares/altrus")
+    tick.add_argument("--cwd", type=Path, default=Path.cwd(), help="local checkout to work in")
+    tick.add_argument("--state", type=Path, default=None)
+    tick.add_argument("--permission-mode", default="acceptEdits")
+    tick.add_argument("--max-cycles", type=int, default=Budget().max_cycles)
+    tick.add_argument("--max-minutes", type=int, default=Budget().max_minutes)
+    # Opt in, not out. A loop that edits labels and drives Claude by default is the wrong
+    # default for a tool whose whole selling point is that you can inspect it first.
+    tick.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually drive Claude and write labels; omit for a dry run",
+    )
     return parser
 
 
