@@ -127,6 +127,11 @@ def review(decision: str = "approve", cost: float | None = 0.5) -> Result:
     return Result(subtype="success", cost_usd=cost, text=f"Fine.\n\nDECISION: {decision}", turns=1)
 
 
+def squash(text: str) -> str:
+    """Collapse runs of whitespace, so a test does not depend on column alignment."""
+    return " ".join(text.split())
+
+
 class TestTick:
     def tick(
         self,
@@ -153,6 +158,18 @@ class TestTick:
         with open_store(tmp_path / "s.db") as store:
             assert store.review_history("o/r", 94) is None
 
+    def test_a_dry_run_summary_does_not_claim_work_or_cost(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        repo = FakeRepo(prs=[PullRequest(number=94)])
+        self.tick(tmp_path, repo, ScriptedDriver([review()]))
+        out = squash(capsys.readouterr().out)
+        assert "PRs that would be reviewed: 1" in out
+        assert "Issues that would be developed: 0" in out
+        assert "Cost this tick: n/a (nothing ran)" in out
+        assert "PRs reviewed" not in out
+        assert "at least" not in out
+
     def test_execute_reviews_writes_records_and_summarises(
         self, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
@@ -165,9 +182,9 @@ class TestTick:
         assert len(driver.calls) == 1
         assert driver.calls[0][1] == tmp_path
         assert [c[:2] for c in writes.comments] == [("pr", 94)]
-        assert "PRs reviewed:        1" in out
-        assert "Issues developed:    0" in out
-        assert "Cost this tick:      $0.5000" in out
+        assert "PRs reviewed: 1" in squash(out)
+        assert "Issues developed: 0" in squash(out)
+        assert "Cost this tick: $0.5000" in squash(out)
         with open_store(tmp_path / "s.db") as store:
             history = store.review_history("o/r", 94)
         assert history is not None
@@ -185,7 +202,7 @@ class TestTick:
         )
         assert code == 0
         assert "Implement issue #13" in driver.calls[0][0]
-        assert "Issues developed:    1" in capsys.readouterr().out
+        assert "Issues developed: 1" in squash(capsys.readouterr().out)
 
     def test_max_cost_ends_the_tick(
         self, capsys: pytest.CaptureFixture[str], tmp_path: Path
@@ -205,7 +222,7 @@ class TestTick:
         repo = FakeRepo(prs=[PullRequest(number=94)])
         driver = ScriptedDriver([review(cost=None)])
         self.tick(tmp_path, repo, driver, "--execute", "--max-cycles", "1", writes=RecordedWrites())
-        assert "at least $0.0000" in capsys.readouterr().out
+        assert "Cost this tick: at least $0.0000" in squash(capsys.readouterr().out)
 
     def test_a_failed_cycle_exits_non_zero(self, tmp_path: Path) -> None:
         repo = FakeRepo(prs=[PullRequest(number=94)])

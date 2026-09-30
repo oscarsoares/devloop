@@ -180,18 +180,25 @@ def _status(repo: Repository, budget: Budget, store: Store) -> int:
 
 def _tick_summary(outcome: TickOutcome, *, dry_run: bool) -> str:
     """What one tick did, in the terms the user asks about: reviews, developments, cost."""
-    unreported = any(c.cost_usd is None for c in outcome.cycles)
-    spent = sum(c.cost_usd or 0.0 for c in outcome.cycles)
-    floor = "at least " if unreported else ""
+    if dry_run:
+        # The cycles of a dry run are decisions, not runs: nothing was reviewed or developed,
+        # and no cost exists to report, so neither count nor cost is shown as though it did.
+        reviews, developments = "PRs that would be reviewed:", "Issues that would be developed:"
+        cost = "n/a (nothing ran)"
+    else:
+        reviews, developments = "PRs reviewed:", "Issues developed:"
+        unreported = any(c.cost_usd is None for c in outcome.cycles)
+        spent = sum(c.cost_usd or 0.0 for c in outcome.cycles)
+        cost = f"{'at least ' if unreported else ''}${spent:.4f}"
     lines = [
         "",
         "Dry run: nothing was written and Claude was not run." if dry_run else "Tick finished.",
-        f"  PRs reviewed:        {outcome.reviews}",
-        f"  Issues developed:    {outcome.developments}",
-        f"  Cost this tick:      {floor}${spent:.4f}",
-        f"  Cost, all recorded:  {'at least ' if outcome.spend.partial else ''}"
+        f"  {reviews:<32} {outcome.reviews}",
+        f"  {developments:<32} {outcome.developments}",
+        f"  {'Cost this tick:':<32} {cost}",
+        f"  {'Cost, all recorded:':<32} {'at least ' if outcome.spend.partial else ''}"
         f"${outcome.spend.cost_usd:.4f} over {outcome.spend.cycles} cycle(s)",
-        f"  Stopped:             {outcome.stop_reason.value}",
+        f"  {'Stopped:':<32} {outcome.stop_reason.value}",
     ]
     return "\n".join(lines)
 
