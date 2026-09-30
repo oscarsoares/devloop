@@ -11,7 +11,14 @@ from collections.abc import Iterator
 import pytest
 
 from devloop.models import PullRequest
-from devloop.store import SCHEMA_VERSION, CycleRecord, Store, connect, open_store
+from devloop.store import (
+    SCHEMA_VERSION,
+    CycleRecord,
+    InvalidValueError,
+    Store,
+    connect,
+    open_store,
+)
 
 REPO = "oscarsoares/altrus"
 
@@ -165,3 +172,109 @@ class TestEscalations:
     def test_resolving_something_never_raised_is_not_an_error(self, store: Store) -> None:
         store.resolve_escalation(REPO, "issue", 999)
         assert store.open_escalations(REPO) == []
+
+
+class TestReviewHistory:
+    def test_an_unseen_pr_has_no_history(self, store: Store) -> None:
+        assert store.review_history(REPO, 94) is None
+
+    def test_a_review_records_round_cost_decision_and_time(self, store: Store) -> None:
+        assert store.record_review(REPO, 94, 0.25, "request_changes") == 1
+        history = store.review_history(REPO, 94)
+        assert history is not None
+        assert (history.rounds, history.cost_usd, history.last_decision) == (
+            1,
+            0.25,
+            "request_changes",
+        )
+        assert history.last_action_at
+
+    def test_rounds_and_cost_accumulate_and_the_last_decision_wins(self, store: Store) -> None:
+        store.record_review(REPO, 94, 0.25, "request_changes")
+        assert store.record_review(REPO, 94, 0.5, "approve") == 2
+        history = store.review_history(REPO, 94)
+        assert history is not None
+        assert (history.rounds, history.cost_usd, history.last_decision) == (2, 0.75, "approve")
+
+    def test_it_feeds_the_same_budget_as_record_review_round(self, store: Store) -> None:
+        store.record_review_round(REPO, 94)
+        store.record_review(REPO, 94, 0.1, "block")
+        assert store.rounds_for(REPO, 94) == 2
+
+    def test_a_round_without_a_review_leaves_no_decision(self, store: Store) -> None:
+        store.record_review_round(REPO, 94)
+        history = store.review_history(REPO, 94)
+        assert history is not None
+        assert history.last_decision is None
+        assert history.cost_usd == 0.0
+
+    def test_a_decision_outside_the_contract_is_rejected_and_not_stored(self, store: Store) -> None:
+        with pytest.raises(InvalidValueError, match="decision"):
+            store.record_review(REPO, 94, 0.1, "lgtm")  # pyright: ignore[reportArgumentType]
+        assert store.review_history(REPO, 94) is None
+
+
+class TestDevelopmentHistory:
+    def test_an_unseen_issue_has_no_history(self, store: Store) -> None:
+        assert store.development_history(REPO, 5) is None
+
+    def test_attempts_and_cost_accumulate_and_status_follows_the_last(self, store: Store) -> None:
+        assert store.record_development(REPO, 5, 1.0, "in_progress") == 1
+        assert store.record_development(REPO, 5, 0.5, "abandoned") == 2
+        assert store.record_development(REPO, 5, 2.0, "done") == 3
+        history = store.development_history(REPO, 5)
+        assert history is not None
+        assert (history.attempts, history.cost_usd, history.status) == (3, 3.5, "done")
+        assert history.updated_at
+
+    def test_issues_are_tracked_per_repo(self, store: Store) -> None:
+        store.record_development(REPO, 5, 1.0, "done")
+        store.record_development("oscarsoares/chronos", 5, 2.0, "abandoned")
+        history = store.development_history(REPO, 5)
+        assert history is not None
+        assert history.status == "done"
+
+    def test_a_status_outside_the_contract_is_rejected(self, store: Store) -> None:
+        with pytest.raises(InvalidValueError, match="status"):
+            store.record_development(REPO, 5, 1.0, "finished")  # pyright: ignore[reportArgumentType]
+        assert store.development_history(REPO, 5) is None
+
+
+class TestTotalCost:
+    def test_nothing_recorded_is_zero(self, store: Store) -> None:
+        assert store.total_cost() == 0.0
+
+    def test_sums_reviews_and_development(self, store: Store) -> None:
+        store.record_review(REPO, 94, 0.25, "approve")
+        store.record_review(REPO, 96, 0.5, "block")
+        store.record_development(REPO, 5, 1.0, "done")
+        assert store.total_cost() == 1.75
+
+    def test_can_be_scoped_to_a_repo(self, store: Store) -> None:
+        store.record_review(REPO, 94, 0.25, "approve")
+        store.record_development("oscarsoares/chronos", 5, 1.0, "done")
+        assert store.total_cost(REPO) == 0.25
+        assert store.total_cost("oscarsoares/chronos") == 1.0
+
+
+class TestMigration:
+    def test_a_version_1_database_gains_the_new_columns_and_keeps_its_rounds(self) -> None:
+        connection = connect(":memory:")
+        connection.executescript(
+            """
+            CREATE TABLE pr_review (
+                repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+                rounds INTEGER NOT NULL DEFAULT 0, last_round_at TEXT,
+                PRIMARY KEY (repo, pr_number)
+            );
+            INSERT INTO pr_review VALUES ('r', 1, 2, '2026-01-01T00:00:00+00:00');
+            PRAGMA user_version = 1;
+            """
+        )
+        store = Store(connection)
+        assert store.schema_version == SCHEMA_VERSION
+        assert store.rounds_for("r", 1) == 2
+        store.record_review("r", 1, 0.5, "approve")
+        history = store.review_history("r", 1)
+        assert history is not None
+        assert (history.rounds, history.cost_usd) == (3, 0.5)
