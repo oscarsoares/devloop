@@ -51,6 +51,9 @@ class PullRequest:
     head_ref: str = ""
     body: str = ""
     """Kept only to work out which issues this PR already owns; no decision reads them."""
+    diff: str | None = None
+    """Only the prompts read it; `None` when it was not fetched."""
+    comments: tuple[str, ...] = ()
 
     @property
     def has_pending_checks(self) -> bool:
@@ -77,6 +80,8 @@ class Issue:
     labels: frozenset[str] = frozenset()
     milestone: str | None = None
     has_open_pr: bool = False
+    body: str = ""
+    """Only the development prompt reads it; no decision does."""
 
     @property
     def priority(self) -> Priority:
