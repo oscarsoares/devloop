@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from devloop._json import as_dict, as_int, as_str, dicts_in, strings_in
@@ -40,6 +41,23 @@ class Repository(Protocol):
     def open_pull_requests(self) -> list[PullRequest]: ...
 
     def open_issues(self) -> list[Issue]: ...
+
+
+class Writes(Protocol):
+    """The only way the loop changes anything outside itself.
+
+    A separate protocol from `Repository` so a dry run can be handed something that cannot
+    write, rather than a writer it is trusted to not call. The difference matters: one is
+    checked by the type system, the other by remembering an `if`.
+    """
+
+    def relabel(
+        self, subject: str, number: int, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None:
+        """Adjust labels. Removing a label an item does not carry is not an error."""
+        ...
+
+    def comment(self, subject: str, number: int, body: str) -> None: ...
 
 
 # gh's statusCheckRollup mixes two shapes: a CheckRun carries `status` and `conclusion`, a
@@ -108,6 +126,43 @@ _PR_FIELDS = "number,title,labels,reviewDecision,statusCheckRollup,headRefName,b
 _ISSUE_FIELDS = "number,title,labels,milestone"
 
 
+def _label_args(flag: str, labels: Sequence[str]) -> tuple[str, ...]:
+    return tuple(part for label in labels for part in (flag, label))
+
+
+@dataclass(slots=True)
+class RecordedWrites:
+    """A `Writes` that records instead of acting, for a dry run.
+
+    The dry-run path is the same code as the real one, with a different collaborator. Nothing
+    is skipped, so what a dry run reports is what a real run would do — which is the only way
+    the report is worth reading.
+    """
+
+    relabels: list[tuple[str, int, tuple[str, ...], tuple[str, ...]]] = field(
+        default_factory=list[tuple[str, int, tuple[str, ...], tuple[str, ...]]]
+    )
+    comments: list[tuple[str, int, str]] = field(default_factory=list[tuple[str, int, str]])
+
+    def relabel(
+        self, subject: str, number: int, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None:
+        self.relabels.append((subject, number, tuple(add), tuple(remove)))
+
+    def comment(self, subject: str, number: int, body: str) -> None:
+        self.comments.append((subject, number, body))
+
+    def describe(self) -> list[str]:
+        lines = [
+            f"label {subject} #{number}"
+            + (f" +{'/'.join(add)}" if add else "")
+            + (f" -{'/'.join(remove)}" if remove else "")
+            for subject, number, add, remove in self.relabels
+        ]
+        lines += [f"comment on {subject} #{number}" for subject, number, _ in self.comments]
+        return lines
+
+
 @dataclass(frozen=True, slots=True)
 class GhRepository:
     """A repository read through the `gh` CLI."""
@@ -117,7 +172,7 @@ class GhRepository:
     executable: str = "gh"
     timeout_seconds: int = 120
 
-    def _json(self, *args: str) -> list[dict[str, object]]:
+    def _exec(self, *args: str) -> str:
         argv = (self.executable, *args, "--repo", self.slug)
         try:
             completed = subprocess.run(  # noqa: S603 - argv is built here, never shell-parsed
@@ -129,26 +184,45 @@ class GhRepository:
                 timeout=self.timeout_seconds,
                 check=False,
             )
-        except OSError as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             raise GitHubError.command_failed(argv, str(exc)) from exc
-
         if completed.returncode != 0:
             raise GitHubError.command_failed(argv, completed.stderr or completed.stdout)
+        return completed.stdout
 
+    def _json(self, *args: str) -> list[dict[str, object]]:
         try:
-            payload: object = json.loads(completed.stdout)
+            payload: object = json.loads(self._exec(*args))
         except json.JSONDecodeError as exc:
-            raise GitHubError.not_json(argv) from exc
+            raise GitHubError.not_json((self.executable, *args)) from exc
         return dicts_in(payload)
 
     def open_pull_requests(self) -> list[PullRequest]:
-        rows = self._json("pr", "list", "--state", "open", "--limit", str(self.limit),
-                          "--json", _PR_FIELDS)
+        rows = self._json(
+            "pr", "list", "--state", "open", "--limit", str(self.limit), "--json", _PR_FIELDS
+        )
         return [pull_request_from(row) for row in rows]
 
     def open_issues(self) -> list[Issue]:
         prs = self.open_pull_requests()
         return self.open_issues_given(prs)
+
+    def relabel(
+        self, subject: str, number: int, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None:
+        # Adds and removes are separate calls because `gh` fails the whole command when asked
+        # to remove a label the item does not carry — and a triaged issue never carries
+        # `ready-to-dev`. Losing a tick to label bookkeeping is not a trade worth making.
+        if add:
+            self._exec(subject, "edit", str(number), *_label_args("--add-label", add))
+        for label in remove:
+            try:
+                self._exec(subject, "edit", str(number), "--remove-label", label)
+            except GitHubError:  # noqa: PERF203 - one call per label is the point
+                continue
+
+    def comment(self, subject: str, number: int, body: str) -> None:
+        self._exec(subject, "comment", str(number), "--body", body)
 
     def open_issues_given(self, prs: list[PullRequest]) -> list[Issue]:
         """Issues, with PR ownership resolved against an already-fetched PR list.
@@ -156,6 +230,7 @@ class GhRepository:
         Exposed separately so a tick that already listed the PRs does not list them twice.
         """
         owned = issues_owned_by(prs)
-        rows = self._json("issue", "list", "--state", "open", "--limit", str(self.limit),
-                          "--json", _ISSUE_FIELDS)
+        rows = self._json(
+            "issue", "list", "--state", "open", "--limit", str(self.limit), "--json", _ISSUE_FIELDS
+        )
         return [issue_from(row, owned_numbers=owned) for row in rows]
