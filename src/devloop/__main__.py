@@ -1,8 +1,8 @@
 """The `devloop` command.
 
-The tick loop is not built yet, so this exposes the one piece that is: `devloop run` drives a
-single prompt through a `ClaudeDriver` and prints its events as they arrive. That is enough
-to measure what a cycle costs, which is the number the driver choice is waiting on.
+`run` drives one prompt through a `ClaudeDriver` and prints its events, which is enough to
+measure what a cycle costs. `status` reports what the loop would do. `tick` does it: reviews
+and development until a budget or the work runs out, a dry run unless `--execute` is given.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from devloop.decide import actionable_prs, classify_pr, next_issue, rank_issues
 from devloop.drivers import ClaudeDriver
 from devloop.drivers.cli import CliDriver, DriverError
 from devloop.events import Event, Result, SessionStarted, Text, ToolCall, Unknown
-from devloop.github import GhRepository, GitHubError, Repository
+from devloop.github import GhRepository, GitHubError, RecordedWrites, Repository, Writes
+from devloop.loop import StopReason, Tick, TickOutcome
 from devloop.models import Budget
 from devloop.store import Store, default_path, open_store
 
@@ -91,6 +92,9 @@ def _parser() -> argparse.ArgumentParser:
     tick.add_argument("--permission-mode", default="acceptEdits")
     tick.add_argument("--max-cycles", type=int, default=Budget().max_cycles)
     tick.add_argument("--max-minutes", type=int, default=Budget().max_minutes)
+    tick.add_argument(
+        "--max-cost", type=float, default=None, help="stop the tick once this many USD are spent"
+    )
     # Opt in, not out. A loop that edits labels and drives Claude by default is the wrong
     # default for a tool whose whole selling point is that you can inspect it first.
     tick.add_argument(
@@ -174,6 +178,71 @@ def _status(repo: Repository, budget: Budget, store: Store) -> int:
     return 0
 
 
+def _tick_summary(outcome: TickOutcome, *, dry_run: bool) -> str:
+    """What one tick did, in the terms the user asks about: reviews, developments, cost."""
+    unreported = any(c.cost_usd is None for c in outcome.cycles)
+    spent = sum(c.cost_usd or 0.0 for c in outcome.cycles)
+    floor = "at least " if unreported else ""
+    lines = [
+        "",
+        "Dry run: nothing was written and Claude was not run." if dry_run else "Tick finished.",
+        f"  PRs reviewed:        {outcome.reviews}",
+        f"  Issues developed:    {outcome.developments}",
+        f"  Cost this tick:      {floor}${spent:.4f}",
+        f"  Cost, all recorded:  {'at least ' if outcome.spend.partial else ''}"
+        f"${outcome.spend.cost_usd:.4f} over {outcome.spend.cycles} cycle(s)",
+        f"  Stopped:             {outcome.stop_reason.value}",
+    ]
+    return "\n".join(lines)
+
+
+def _tick(
+    args: argparse.Namespace,
+    *,
+    driver: ClaudeDriver | None,
+    repo: Repository | None,
+    writes: Writes | None,
+) -> int:
+    if not args.cwd.is_dir():
+        print(f"devloop: {args.cwd} is not a directory", file=sys.stderr)
+        return 1
+
+    dry_run = not args.execute
+    chosen_repo = repo or GhRepository(slug=args.repo)
+    # A dry run is handed a writer that only records, so it cannot write by construction.
+    chosen_writes: Writes = (
+        RecordedWrites()
+        if dry_run
+        else writes or (chosen_repo if isinstance(chosen_repo, GhRepository) else RecordedWrites())
+    )
+    budget = Budget(
+        max_cycles=args.max_cycles, max_minutes=args.max_minutes, max_cost_usd=args.max_cost
+    )
+    chosen_driver = driver or CliDriver(permission_mode=args.permission_mode)
+
+    mode = "dry run" if dry_run else "EXECUTING"
+    print(f"{chosen_repo.slug} in {args.cwd}: {mode}, driver {chosen_driver.name}", flush=True)
+    try:
+        with open_store(args.state or default_path()) as store:
+            tick = Tick(
+                repo=chosen_repo,
+                writes=chosen_writes,
+                driver=chosen_driver,
+                store=store,
+                cwd=args.cwd,
+                budget=budget,
+                dry_run=dry_run,
+                on_event=lambda line: print(line, flush=True),
+            )
+            outcome = tick.run()
+    except (GitHubError, DriverError) as exc:
+        print(f"devloop: {exc}", file=sys.stderr)
+        return 1
+
+    print(_tick_summary(outcome, dry_run=dry_run))
+    return 1 if outcome.stop_reason is StopReason.CYCLE_FAILED else 0
+
+
 def _run(prompt: str, cwd: Path, driver: ClaudeDriver) -> int:
     if not cwd.is_dir():
         print(f"devloop: {cwd} is not a directory", file=sys.stderr)
@@ -199,6 +268,7 @@ def main(
     *,
     driver: ClaudeDriver | None = None,
     repo: Repository | None = None,
+    writes: Writes | None = None,
 ) -> int:
     _use_utf8_stdout()
     parser = _parser()
@@ -215,6 +285,8 @@ def main(
             except GitHubError as exc:
                 print(f"devloop: {exc}", file=sys.stderr)
                 return 1
+        case "tick":
+            return _tick(args, driver=driver, repo=repo, writes=writes)
         case _:
             parser.print_help()
             return 0
