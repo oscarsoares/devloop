@@ -15,7 +15,7 @@ import json
 import re
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from devloop._json import as_dict, as_int, as_str, dicts_in, strings_in
@@ -103,7 +103,14 @@ def issue_from(raw: dict[str, object], *, owned_numbers: frozenset[int]) -> Issu
         labels=strings_in(raw.get("labels"), key="name"),
         milestone=as_str(milestone.get("title")) if milestone else None,
         has_open_pr=number in owned_numbers,
+        body=as_str(raw.get("body")) or "",
     )
+
+
+def comment_bodies_from(raw: dict[str, object]) -> tuple[str, ...]:
+    """The text of each comment in a `gh pr view --json comments` payload, oldest first."""
+    found = (as_str(comment.get("body")) for comment in dicts_in(raw.get("comments")))
+    return tuple(body for body in found if body)
 
 
 def issues_owned_by(prs: list[PullRequest]) -> frozenset[int]:
@@ -123,7 +130,7 @@ def issues_owned_by(prs: list[PullRequest]) -> frozenset[int]:
 
 
 _PR_FIELDS = "number,title,labels,reviewDecision,statusCheckRollup,headRefName,body"
-_ISSUE_FIELDS = "number,title,labels,milestone"
+_ISSUE_FIELDS = "number,title,labels,milestone,body"
 
 
 def _label_args(flag: str, labels: Sequence[str]) -> tuple[str, ...]:
@@ -190,12 +197,31 @@ class GhRepository:
             raise GitHubError.command_failed(argv, completed.stderr or completed.stdout)
         return completed.stdout
 
-    def _json(self, *args: str) -> list[dict[str, object]]:
+    def _payload(self, *args: str) -> object:
         try:
-            payload: object = json.loads(self._exec(*args))
+            return json.loads(self._exec(*args))
         except json.JSONDecodeError as exc:
             raise GitHubError.not_json((self.executable, *args)) from exc
-        return dicts_in(payload)
+
+    def _json(self, *args: str) -> list[dict[str, object]]:
+        return dicts_in(self._payload(*args))
+
+    def with_review_context(self, pr: PullRequest) -> PullRequest:
+        """`pr` with its diff and comments, for the one PR about to be reviewed.
+
+        Separate from `open_pull_requests` because that runs every tick over every open PR,
+        and a diff plus a comment fetch each would multiply the calls for PRs nobody reviews.
+        A diff that cannot be fetched (too large, or a race with a merge) leaves `None` so the
+        prompt says so; comments are not swallowed, since a review that silently ignores what
+        was already said is worse than a failed one.
+        """
+        number = str(pr.number)
+        try:
+            diff: str | None = self._exec("pr", "diff", number)
+        except GitHubError:
+            diff = None
+        payload = as_dict(self._payload("pr", "view", number, "--json", "comments")) or {}
+        return replace(pr, diff=diff, comments=comment_bodies_from(payload))
 
     def open_pull_requests(self) -> list[PullRequest]:
         rows = self._json(

@@ -17,6 +17,7 @@ from devloop.github import (
     GitHubError,
     RecordedWrites,
     check_state,
+    comment_bodies_from,
     issue_from,
     issues_owned_by,
     pull_request_from,
@@ -122,6 +123,28 @@ class TestIssueMapping:
         issue = issue_from({"number": 68}, owned_numbers=frozenset({68}))
         assert issue.has_open_pr
 
+    def test_body_is_mapped_and_defaults_to_empty(self) -> None:
+        with_body = issue_from({"number": 1, "body": "Do the thing"}, owned_numbers=frozenset())
+        assert with_body.body == "Do the thing"
+        assert issue_from({"number": 1, "body": None}, owned_numbers=frozenset()).body == ""
+        assert issue_from({"number": 1}, owned_numbers=frozenset()).body == ""
+
+
+class TestCommentBodies:
+    def test_bodies_are_extracted_in_order(self) -> None:
+        raw: dict[str, object] = {
+            "comments": [{"body": "first", "author": {"login": "a"}}, {"body": "second"}]
+        }
+        assert comment_bodies_from(raw) == ("first", "second")
+
+    def test_empty_and_malformed_entries_are_skipped(self) -> None:
+        raw: dict[str, object] = {"comments": [{"body": ""}, {"body": 3}, "x", {"body": "kept"}]}
+        assert comment_bodies_from(raw) == ("kept",)
+
+    def test_no_comments_is_an_empty_tuple(self) -> None:
+        assert comment_bodies_from({}) == ()
+        assert comment_bodies_from({"comments": None}) == ()
+
 
 class TestOwnership:
     def test_a_branch_name_claims_its_issue(self) -> None:
@@ -181,15 +204,19 @@ class TestGhReads:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         pr = {"number": 1, "headRefName": "agent/issue-5-x"}
-        issues = [{"number": 5, "title": "a"}, {"number": 6, "title": "b"}]
+        issues = [{"number": 5, "title": "a", "body": "text"}, {"number": 6, "title": "b"}]
         replies = iter([json.dumps([pr]), json.dumps(issues)])
+        calls: list[tuple[str, ...]] = []
 
         def run(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
             return subprocess.CompletedProcess([], 0, next(replies), "")
 
         monkeypatch.setattr(subprocess, "run", run)
         found = GhRepository("o/r").open_issues()
         assert {i.number: i.has_open_pr for i in found} == {5: True, 6: False}
+        assert {i.number: i.body for i in found} == {5: "text", 6: ""}
+        assert "body" in calls[1][calls[1].index("--json") + 1].split(",")
 
     def test_a_nonzero_exit_raises_with_the_stderr(self, monkeypatch: pytest.MonkeyPatch) -> None:
         repo = patched(monkeypatch, FakeGh(returncode=1, stderr="auth required"))
@@ -206,6 +233,72 @@ class TestGhReads:
     ) -> None:
         with pytest.raises(GitHubError):
             patched(monkeypatch, FakeGh(raises=exc)).open_pull_requests()
+
+
+class TestReviewContext:
+    """`gh pr diff` prints text, `gh pr view --json comments` prints an object."""
+
+    @staticmethod
+    def routed(
+        monkeypatch: pytest.MonkeyPatch, *, diff: subprocess.CompletedProcess[str], comments: str
+    ) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+
+        def run(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            if argv[1:3] == ("pr", "diff"):
+                return diff
+            return subprocess.CompletedProcess([], 0, comments, "")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        return calls
+
+    def test_fills_diff_and_comments(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = self.routed(
+            monkeypatch,
+            diff=subprocess.CompletedProcess([], 0, "+added line\n", ""),
+            comments=json.dumps({"comments": [{"body": "nit"}, {"body": "ok"}]}),
+        )
+        pr = GhRepository("o/r").with_review_context(pull_request_from({"number": 7, "title": "t"}))
+        assert pr.diff == "+added line\n"
+        assert pr.comments == ("nit", "ok")
+        assert pr.title == "t"
+        assert ("gh", "pr", "diff", "7", "--repo", "o/r") in calls
+        assert ("gh", "pr", "view", "7", "--json", "comments", "--repo", "o/r") in calls
+
+    def test_a_failed_diff_is_none_and_comments_still_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.routed(
+            monkeypatch,
+            diff=subprocess.CompletedProcess([], 1, "", "diff too large"),
+            comments=json.dumps({"comments": [{"body": "nit"}]}),
+        )
+        pr = GhRepository("o/r").with_review_context(pull_request_from({"number": 7}))
+        assert pr.diff is None
+        assert pr.comments == ("nit",)
+
+    def test_an_empty_diff_stays_a_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.routed(
+            monkeypatch,
+            diff=subprocess.CompletedProcess([], 0, "", ""),
+            comments=json.dumps({"comments": []}),
+        )
+        pr = GhRepository("o/r").with_review_context(pull_request_from({"number": 7}))
+        assert pr.diff == ""
+        assert pr.comments == ()
+
+    def test_a_failed_comments_fetch_is_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeGh(returncode=1, stderr="rate limited")
+        repo = patched(monkeypatch, fake)
+        with pytest.raises(GitHubError, match="rate limited"):
+            repo.with_review_context(pull_request_from({"number": 7}))
+
+    def test_listing_does_not_fetch_diffs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeGh(json.dumps([{"number": 1}, {"number": 2}]))
+        prs = patched(monkeypatch, fake).open_pull_requests()
+        assert len(fake.calls) == 1
+        assert [p.diff for p in prs] == [None, None]
 
 
 class TestGhWrites:
